@@ -1,0 +1,3 @@
+[deploy]
+cronSchedule = "0 8 * * *"
+startCommand = "python sync.py"
