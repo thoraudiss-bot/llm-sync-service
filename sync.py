@@ -33,6 +33,7 @@ SHARED_DRIVE_NAMES = [
     "Rossmonster Builds",
     "marketing",
     "Rossmonster CAD",
+    "Sales",
 ]
 
 PINECONE_INDEX    = os.environ.get("PINECONE_INDEX", "rossmonster-llm-db")
