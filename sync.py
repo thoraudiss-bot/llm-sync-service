@@ -1,6 +1,10 @@
 """
 sync.py — Cloud version of LLM Database Sync
 Runs on Railway as a cron job. Uses PostgreSQL for sync state persistence.
+
+Uses the Google Drive Changes API for incremental syncs — only processes
+files that have actually changed since the last run instead of listing
+all 60,000+ files every time.
 """
 
 import os, json, io, time, traceback, urllib.request, re
@@ -85,6 +89,13 @@ def init_db():
                     modified_time TEXT NOT NULL
                 )
             """)
+            # Stores the Drive Changes API page token per drive
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS drive_tokens (
+                    drive_id TEXT PRIMARY KEY,
+                    page_token TEXT NOT NULL
+                )
+            """)
         conn.commit()
 
 def load_sync_state():
@@ -103,6 +114,29 @@ def save_file_state(file_id, modified_time):
             """, (file_id, modified_time))
         conn.commit()
 
+def remove_file_state(file_id):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sync_state WHERE file_id = %s", (file_id,))
+        conn.commit()
+
+def load_drive_token(drive_id):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT page_token FROM drive_tokens WHERE drive_id = %s", (drive_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+def save_drive_token(drive_id, page_token):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO drive_tokens (drive_id, page_token)
+                VALUES (%s, %s)
+                ON CONFLICT (drive_id) DO UPDATE SET page_token = EXCLUDED.page_token
+            """, (drive_id, page_token))
+        conn.commit()
+
 # ─── DRIVE HELPERS ────────────────────────────────────────────────────────────
 
 def find_shared_drive_id(service, name):
@@ -112,7 +146,51 @@ def find_shared_drive_id(service, name):
             return drive["id"]
     raise ValueError(f"Shared Drive '{name}' not found. Make sure the service account has been added as a Viewer.")
 
+def get_start_page_token(service, drive_id):
+    """Get the current Changes API page token for a drive (marks 'start tracking from now')."""
+    resp = service.changes().getStartPageToken(
+        driveId=drive_id,
+        supportsAllDrives=True,
+    ).execute()
+    return resp.get("startPageToken")
+
+def get_drive_changes(service, drive_id, page_token):
+    """
+    Fetch all changes since page_token using the Drive Changes API.
+    Returns (list_of_changes, new_start_token).
+    Each change has: fileId, removed (bool), file (dict or None if removed).
+    """
+    changes = []
+    current_token = page_token
+    while True:
+        for attempt in range(3):
+            try:
+                resp = service.changes().list(
+                    pageToken=current_token,
+                    driveId=drive_id,
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                    spaces="drive",
+                    fields="nextPageToken, newStartPageToken, changes(fileId, removed, file(id, name, mimeType, modifiedTime, shortcutDetails))",
+                    pageSize=1000,
+                ).execute()
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                print(f"  ⚠️  Changes API error (attempt {attempt+1}/3): {e} — retrying in 5s...")
+                time.sleep(5)
+
+        changes.extend(resp.get("changes", []))
+
+        if "nextPageToken" in resp:
+            current_token = resp["nextPageToken"]
+        else:
+            new_token = resp.get("newStartPageToken")
+            return changes, new_token
+
 def list_all_files(service, drive_id):
+    """Full file listing — only used on first run for a drive."""
     files = []
     page_token = None
     while True:
@@ -231,20 +309,89 @@ def embed_texts(texts):
         all_vectors.extend([item.embedding for item in response.data])
     return all_vectors
 
+def process_file(service, index, file, drive_name, sync_state):
+    """
+    Embed and upsert a single file into Pinecone.
+    Returns number of vectors upserted (0 if skipped or failed).
+    """
+    if file.get("mimeType") == "application/vnd.google-apps.shortcut":
+        file = resolve_shortcut(service, file)
+        if not file:
+            return 0
+
+    fid      = file["id"]
+    fname    = file["name"]
+    modified = file["modifiedTime"]
+    mime     = file["mimeType"]
+
+    if mime == "application/vnd.google-apps.folder":
+        return 0
+
+    if sync_state.get(fid) == modified:
+        return -1  # unchanged
+
+    text = extract_text(service, file)
+    if not text or not text.strip():
+        return 0
+
+    chunks = chunk_text(text)
+    if not chunks:
+        return 0
+
+    try:
+        vectors = embed_texts(chunks)
+    except Exception as e:
+        print(f"  ⚠️  Embedding failed for '{fname}': {e}")
+        return 0
+
+    records = []
+    for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
+        records.append({
+            "id": f"{fid}_chunk_{i}",
+            "values": vector,
+            "metadata": {
+                "file_id":       fid,
+                "file_name":     fname,
+                "mime_type":     mime,
+                "modified_time": modified,
+                "chunk_index":   i,
+                "total_chunks":  len(chunks),
+                "text":          chunk,
+                "drive_name":    drive_name,
+            },
+        })
+
+    for i in range(0, len(records), 100):
+        index.upsert(vectors=records[i:i+100])
+
+    save_file_state(fid, modified)
+    sync_state[fid] = modified
+    return len(records)
+
+def delete_file_vectors(index, file_id):
+    """Delete all Pinecone vectors for a given file."""
+    try:
+        index.delete(filter={"file_id": file_id})
+    except Exception as e:
+        print(f"  ⚠️  Could not delete vectors for {file_id}: {e}")
+
 # ─── SLACK NOTIFICATION ───────────────────────────────────────────────────────
 
-def send_slack(success, upserted, skipped, error=None):
+def send_slack(success, upserted, skipped, deleted=0, full_sync_drives=None, error=None):
     if not SLACK_WEBHOOK_URL:
         return
     try:
         if success:
+            mode = "Full sync" if full_sync_drives else "Incremental sync"
             text = (
-                f"✅ *LLM Database Sync Complete*\n"
+                f"✅ *LLM Database Sync Complete* ({mode})\n"
                 f"• Vectors upserted: {upserted:,}\n"
-                f"• Files skipped: {skipped:,} (already up to date)\n"
-                f"• Drives: {', '.join(SHARED_DRIVE_NAMES)}\n"
-                f"• Completed: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"
+                f"• Files unchanged: {skipped:,}\n"
+                f"• Files deleted from index: {deleted:,}\n"
             )
+            if full_sync_drives:
+                text += f"• First-time full scan: {', '.join(full_sync_drives)}\n"
+            text += f"• Completed: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"
         else:
             text = (
                 f"❌ *LLM Database Sync Failed*\n"
@@ -275,6 +422,8 @@ def sync():
 
     upserted_total = 0
     skipped_total  = 0
+    deleted_total  = 0
+    full_sync_drives = []
 
     for drive_name in SHARED_DRIVE_NAMES:
         print(f"\n🔍 Finding Shared Drive: '{drive_name}'...")
@@ -285,71 +434,77 @@ def sync():
             print(f"   ⚠️  Skipping: {e}")
             continue
 
-        print("📂 Listing all files...")
-        files = list_all_files(service, drive_id)
-        print(f"   Found {len(files)} files")
+        stored_token = load_drive_token(drive_id)
 
-        for file in tqdm(files, desc=f"Processing '{drive_name}'"):
-            if file.get("mimeType") == "application/vnd.google-apps.shortcut":
-                file = resolve_shortcut(service, file)
-                if not file:
-                    continue
+        if stored_token is None:
+            # ── FIRST RUN: full file scan ──────────────────────────────────
+            print(f"   No Changes token found — doing full scan (first time only)...")
+            full_sync_drives.append(drive_name)
 
-            fid      = file["id"]
-            fname    = file["name"]
-            modified = file["modifiedTime"]
-            mime     = file["mimeType"]
+            # Grab the start token BEFORE listing so we don't miss any changes
+            # that happen during this initial scan
+            start_token = get_start_page_token(service, drive_id)
 
-            if mime == "application/vnd.google-apps.folder":
-                continue
+            print("📂 Listing all files...")
+            files = list_all_files(service, drive_id)
+            print(f"   Found {len(files):,} files")
 
-            if sync_state.get(fid) == modified:
-                skipped_total += 1
-                continue
+            for file in tqdm(files, desc=f"Full scan '{drive_name}'"):
+                result = process_file(service, index, file, drive_name, sync_state)
+                if result > 0:
+                    upserted_total += result
+                elif result == -1:
+                    skipped_total += 1
 
-            text = extract_text(service, file)
-            if not text or not text.strip():
-                continue
+            save_drive_token(drive_id, start_token)
+            print(f"   ✅ Full scan complete — Changes token saved")
 
-            chunks = chunk_text(text)
-            if not chunks:
-                continue
+        else:
+            # ── INCREMENTAL: only changed files ───────────────────────────
+            print(f"   Changes token found — fetching incremental changes...")
+            changes, new_token = get_drive_changes(service, drive_id, stored_token)
 
-            try:
-                vectors = embed_texts(chunks)
-            except Exception as e:
-                print(f"  ⚠️  Embedding failed for '{fname}': {e}")
-                continue
+            # De-duplicate: if the same file changed multiple times, keep last
+            seen = {}
+            for change in changes:
+                seen[change["fileId"]] = change
+            changes = list(seen.values())
 
-            records = []
-            for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
-                records.append({
-                    "id": f"{fid}_chunk_{i}",
-                    "values": vector,
-                    "metadata": {
-                        "file_id":       fid,
-                        "file_name":     fname,
-                        "mime_type":     mime,
-                        "modified_time": modified,
-                        "chunk_index":   i,
-                        "total_chunks":  len(chunks),
-                        "text":          chunk,
-                        "drive_name":    drive_name,
-                    },
-                })
+            added_or_modified = [c for c in changes if not c.get("removed") and c.get("file")]
+            removed = [c for c in changes if c.get("removed")]
 
-            for i in range(0, len(records), 100):
-                index.upsert(vectors=records[i:i+100])
+            print(f"   {len(added_or_modified)} modified/new files, {len(removed)} deleted")
 
-            # Save progress to DB after each file (not just at the end)
-            save_file_state(fid, modified)
-            sync_state[fid] = modified
-            upserted_total += len(records)
+            for change in tqdm(added_or_modified, desc=f"Incremental '{drive_name}'"):
+                file = change["file"]
+                result = process_file(service, index, file, drive_name, sync_state)
+                if result > 0:
+                    upserted_total += result
+                elif result == -1:
+                    skipped_total += 1
+
+            for change in removed:
+                fid = change["fileId"]
+                print(f"   🗑️  Deleting vectors for removed file: {fid}")
+                delete_file_vectors(index, fid)
+                remove_file_state(fid)
+                if fid in sync_state:
+                    del sync_state[fid]
+                deleted_total += 1
+
+            save_drive_token(drive_id, new_token)
 
     print(f"\n✅ Sync complete!")
-    print(f"   Vectors upserted : {upserted_total}")
-    print(f"   Files skipped    : {skipped_total}")
-    send_slack(success=True, upserted=upserted_total, skipped=skipped_total)
+    print(f"   Vectors upserted : {upserted_total:,}")
+    print(f"   Files unchanged  : {skipped_total:,}")
+    print(f"   Files deleted    : {deleted_total:,}")
+    send_slack(
+        success=True,
+        upserted=upserted_total,
+        skipped=skipped_total,
+        deleted=deleted_total,
+        full_sync_drives=full_sync_drives if full_sync_drives else None,
+    )
 
 if __name__ == "__main__":
     try:
