@@ -116,16 +116,24 @@ def list_all_files(service, drive_id):
     files = []
     page_token = None
     while True:
-        resp = service.files().list(
-            q="trashed = false",
-            corpora="drive",
-            driveId=drive_id,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            fields="nextPageToken, files(id, name, mimeType, modifiedTime, parents, shortcutDetails)",
-            pageSize=200,
-            pageToken=page_token,
-        ).execute()
+        for attempt in range(3):
+            try:
+                resp = service.files().list(
+                    q="trashed = false",
+                    corpora="drive",
+                    driveId=drive_id,
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                    fields="nextPageToken, files(id, name, mimeType, modifiedTime, parents, shortcutDetails)",
+                    pageSize=200,
+                    pageToken=page_token,
+                ).execute()
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                print(f"  ⚠️  Google API error (attempt {attempt+1}/3): {e} — retrying in 5s...")
+                time.sleep(5)
         files.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
