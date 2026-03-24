@@ -3,7 +3,7 @@ sync.py — Cloud version of LLM Database Sync
 Runs on Railway as a cron job. Uses PostgreSQL for sync state persistence.
 """
 
-import os, json, io, time, traceback, urllib.request
+import os, json, io, time, traceback, urllib.request, re
 from datetime import datetime
 
 import psycopg2
@@ -211,10 +211,14 @@ def chunk_text(text):
         start += CHUNK_SIZE - CHUNK_OVERLAP
     return chunks
 
+def sanitize_text(text):
+    """Remove control characters that break JSON serialization."""
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
 def embed_texts(texts):
     all_vectors = []
     for i in range(0, len(texts), 100):
-        batch = texts[i:i + 100]
+        batch = [sanitize_text(t) for t in texts[i:i + 100]]
         response = openai_client.embeddings.create(input=batch, model=EMBED_MODEL)
         all_vectors.extend([item.embedding for item in response.data])
     return all_vectors
