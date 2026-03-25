@@ -465,8 +465,11 @@ def sync():
             changes, new_token = get_drive_changes(service, drive_id, stored_token)
 
             # De-duplicate: if the same file changed multiple times, keep last
+            # Skip drive-level changes that have no fileId
             seen = {}
             for change in changes:
+                if "fileId" not in change:
+                    continue
                 seen[change["fileId"]] = change
             changes = list(seen.values())
 
