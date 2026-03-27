@@ -40,8 +40,9 @@ SHARED_DRIVE_NAMES = [
     "Sales",
 ]
 
-PINECONE_INDEX    = os.environ.get("PINECONE_INDEX", "rossmonster-llm-db")
-PINECONE_REGION   = os.environ.get("PINECONE_REGION", "us-east-1")
+PINECONE_INDEX         = os.environ.get("PINECONE_INDEX", "rossmonster-llm-db")
+PINECONE_INDEX_ARCHIVE = os.environ.get("PINECONE_INDEX_ARCHIVE", PINECONE_INDEX + "-archive")
+PINECONE_REGION        = os.environ.get("PINECONE_REGION", "us-east-1")
 EMBED_MODEL       = "text-embedding-3-small"
 EMBED_DIMENSIONS  = 1536
 CHUNK_SIZE        = 500
@@ -58,20 +59,34 @@ def get_drive_service():
     creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     return build("drive", "v3", credentials=creds)
 
-def get_pinecone_index():
-    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+_pc = None
+
+def get_pc():
+    global _pc
+    if _pc is None:
+        _pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    return _pc
+
+def _ensure_index(name):
+    pc = get_pc()
     existing = [i.name for i in pc.list_indexes()]
-    if PINECONE_INDEX not in existing:
-        print(f"Creating Pinecone index '{PINECONE_INDEX}'...")
+    if name not in existing:
+        print(f"Creating Pinecone index '{name}'...")
         pc.create_index(
-            name=PINECONE_INDEX,
+            name=name,
             dimension=EMBED_DIMENSIONS,
             metric="cosine",
             spec=ServerlessSpec(cloud="aws", region=PINECONE_REGION),
         )
-        while not pc.describe_index(PINECONE_INDEX).status["ready"]:
+        while not pc.describe_index(name).status["ready"]:
             time.sleep(1)
-    return pc.Index(PINECONE_INDEX)
+    return pc.Index(name)
+
+def get_pinecone_index():
+    return _ensure_index(PINECONE_INDEX)
+
+def get_pinecone_archive_index():
+    return _ensure_index(PINECONE_INDEX_ARCHIVE)
 
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -368,12 +383,59 @@ def process_file(service, index, file, drive_name, sync_state):
     sync_state[fid] = modified
     return len(records)
 
-def delete_file_vectors(index, file_id):
-    """Delete all Pinecone vectors for a given file."""
+def archive_file_vectors(index, archive_index, file_id):
+    """
+    Move all Pinecone vectors for a deleted Drive file to the archive index
+    instead of hard-deleting them. Uses chunk ID prefix listing.
+    Returns the number of vectors archived.
+    """
+    removed_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    chunk_ids = []
     try:
-        index.delete(filter={"file_id": file_id})
+        for id_batch in index.list(prefix=f"{file_id}_chunk_"):
+            chunk_ids.extend(id_batch)
     except Exception as e:
-        print(f"  ⚠️  Could not delete vectors for {file_id}: {e}")
+        print(f"  ⚠️  Could not list vectors for {file_id}: {e}")
+        # Fall back to metadata-filter delete so nothing is left dangling
+        try:
+            index.delete(filter={"file_id": file_id})
+        except Exception:
+            pass
+        return 0
+
+    if not chunk_ids:
+        return 0
+
+    archived_count = 0
+    for i in range(0, len(chunk_ids), 100):
+        batch = chunk_ids[i:i + 100]
+        try:
+            result = index.fetch(ids=batch)
+        except Exception as e:
+            print(f"  ⚠️  Fetch failed for batch of {file_id}: {e}")
+            continue
+
+        if not result.vectors:
+            continue
+
+        archive_records = []
+        for vid, vec in result.vectors.items():
+            meta = dict(vec.metadata)
+            meta["removed_at"] = removed_at
+            archive_records.append({
+                "id": vid,
+                "values": list(vec.values),
+                "metadata": meta,
+            })
+
+        try:
+            archive_index.upsert(vectors=archive_records)
+            index.delete(ids=batch)
+            archived_count += len(archive_records)
+        except Exception as e:
+            print(f"  ⚠️  Archive upsert/delete failed: {e}")
+
+    return archived_count
 
 # ─── SLACK NOTIFICATION ───────────────────────────────────────────────────────
 
@@ -387,7 +449,7 @@ def send_slack(success, upserted, skipped, deleted=0, full_sync_drives=None, err
                 f"✅ *LLM Database Sync Complete* ({mode})\n"
                 f"• Vectors upserted: {upserted:,}\n"
                 f"• Files unchanged: {skipped:,}\n"
-                f"• Files deleted from index: {deleted:,}\n"
+                f"• Files archived (not deleted): {deleted:,}\n"
             )
             if full_sync_drives:
                 text += f"• First-time full scan: {', '.join(full_sync_drives)}\n"
@@ -420,9 +482,12 @@ def sync():
     sync_state = load_sync_state()
     print(f"   {len(sync_state):,} files already synced")
 
-    upserted_total = 0
-    skipped_total  = 0
-    deleted_total  = 0
+    print("📦 Connecting to Pinecone archive index...")
+    archive_index = get_pinecone_archive_index()
+
+    upserted_total  = 0
+    skipped_total   = 0
+    archived_total  = 0
     full_sync_drives = []
 
     for drive_name in SHARED_DRIVE_NAMES:
@@ -488,24 +553,25 @@ def sync():
 
             for change in removed:
                 fid = change["fileId"]
-                print(f"   🗑️  Deleting vectors for removed file: {fid}")
-                delete_file_vectors(index, fid)
+                print(f"   📦 Archiving vectors for removed file: {fid}")
+                count = archive_file_vectors(index, archive_index, fid)
+                print(f"      Archived {count} vectors")
                 remove_file_state(fid)
                 if fid in sync_state:
                     del sync_state[fid]
-                deleted_total += 1
+                archived_total += 1
 
             save_drive_token(drive_id, new_token)
 
     print(f"\n✅ Sync complete!")
     print(f"   Vectors upserted : {upserted_total:,}")
     print(f"   Files unchanged  : {skipped_total:,}")
-    print(f"   Files deleted    : {deleted_total:,}")
+    print(f"   Files archived   : {archived_total:,} (moved to '{PINECONE_INDEX_ARCHIVE}')")
     send_slack(
         success=True,
         upserted=upserted_total,
         skipped=skipped_total,
-        deleted=deleted_total,
+        deleted=archived_total,
         full_sync_drives=full_sync_drives if full_sync_drives else None,
     )
 
