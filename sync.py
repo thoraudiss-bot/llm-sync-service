@@ -30,6 +30,12 @@ try:
 except ImportError:
     HAS_DOCX = False
 
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
 # ─── CONFIGURATION (from environment variables) ───────────────────────────────
 
 SHARED_DRIVE_NAMES = [
@@ -286,7 +292,24 @@ def extract_text(service, file):
         elif mime == "application/pdf" and HAS_PYPDF:
             buf = download_file(service, fid)
             reader = pypdf.PdfReader(buf)
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            if not text.strip():
+                print(f"  ℹ️  PDF '{file['name']}' returned no extractable text — likely a scanned image, skipping")
+            return text
+        elif mime in (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        ) and HAS_OPENPYXL:
+            buf = download_file(service, fid)
+            wb = openpyxl.load_workbook(buf, read_only=True, data_only=True)
+            parts = []
+            for sheet in wb.worksheets:
+                parts.append(f"[Sheet: {sheet.title}]")
+                for row in sheet.iter_rows(values_only=True):
+                    row_text = "\t".join(str(c) for c in row if c is not None)
+                    if row_text.strip():
+                        parts.append(row_text)
+            return "\n".join(parts) if parts else None
         elif mime in (
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/msword",

@@ -6,3 +6,4 @@ psycopg2-binary
 tqdm
 pypdf
 python-docx
+openpyxl
